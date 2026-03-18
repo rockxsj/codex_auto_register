@@ -1,6 +1,7 @@
 {
     "total_accounts": 3,
     "duckmail_api_base": "https://api.duckmail.sbs",
+    "duckmail_domain": "duckmail.sbs",
     "duckmail_bearer": "",
     "proxy": "http://127.0.0.1:7897",
     "output_file": "registered_accounts.txt",

@@ -62,6 +62,7 @@ python chatgpt_register.py
 | ----------------- | ------------------------ |
 | total_accounts    | 注册账号数量             |
 | duckmail_api_base | DuckMail API 地址        |
+| duckmail_domain   | DuckMail 邮箱域名        |
 | duckmail_bearer   | DuckMail Bearer Token    |
 | proxy             | HTTP/HTTPS 代理          |
 | output_file       | 注册结果输出文件         |
@@ -69,6 +70,8 @@ python chatgpt_register.py
 | oauth_required    | 是否要求 OAuth 成功      |
 | upload_api_url    | 可选，上传到 CPA 的接口  |
 | upload_api_token  | 可选，CPA 管理接口 Token |
+
+支持通过环境变量 `DUCKMAIL_DOMAIN` 覆盖邮箱域名配置（例如：`set DUCKMAIL_DOMAIN=595577126.xyz`）。
 
 ## Codex 协议脚本
 

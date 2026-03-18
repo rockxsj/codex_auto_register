@@ -28,6 +28,7 @@ def _load_config():
     config = {
         "total_accounts": 3,
         "duckmail_api_base": "https://api.duckmail.sbs",
+        "duckmail_domain": "duckmail.sbs",
         "duckmail_bearer": "",
         "proxy": "",
         "output_file": "registered_accounts.txt",
@@ -54,6 +55,7 @@ def _load_config():
 
     # 环境变量优先级更高
     config["duckmail_api_base"] = os.environ.get("DUCKMAIL_API_BASE", config["duckmail_api_base"])
+    config["duckmail_domain"] = os.environ.get("DUCKMAIL_DOMAIN", config["duckmail_domain"])
     config["duckmail_bearer"] = os.environ.get("DUCKMAIL_BEARER", config["duckmail_bearer"])
     config["proxy"] = os.environ.get("PROXY", config["proxy"])
     config["total_accounts"] = int(os.environ.get("TOTAL_ACCOUNTS", config["total_accounts"]))
@@ -79,8 +81,20 @@ def _as_bool(value):
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _normalize_email_domain(value):
+    domain = str(value or "").strip().lower().lstrip("@")
+    if not domain:
+        raise ValueError("不能为空")
+    if any(ch in domain for ch in [" ", "/", "\\", "@"]):
+        raise ValueError(f"包含非法字符: {domain}")
+    if "." not in domain:
+        raise ValueError(f"域名格式不正确: {domain}")
+    return domain
+
+
 _CONFIG = _load_config()
 DUCKMAIL_API_BASE = _CONFIG["duckmail_api_base"]
+DUCKMAIL_DOMAIN = _normalize_email_domain(_CONFIG.get("duckmail_domain", "duckmail.sbs"))
 DUCKMAIL_BEARER = _CONFIG["duckmail_bearer"]
 DEFAULT_TOTAL_ACCOUNTS = _CONFIG["total_accounts"]
 DEFAULT_PROXY = _CONFIG["proxy"]
@@ -104,6 +118,38 @@ if not DUCKMAIL_BEARER:
 # 全局线程锁
 _print_lock = threading.Lock()
 _file_lock = threading.Lock()
+
+
+def _resolve_output_path(path: str) -> str:
+    """将输出文件路径解析为绝对路径，避免因工作目录变化导致写错位置。"""
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    return path if os.path.isabs(path) else os.path.join(base_dir, path)
+
+
+def _append_account_record(output_file: str, line: str, retries: int = 8) -> str:
+    """
+    追加写入账号结果，带重试与 flush/fsync，尽量保证成功落盘。
+    返回最终写入的绝对路径。
+    """
+    target_path = _resolve_output_path(output_file)
+    target_dir = os.path.dirname(target_path)
+    if target_dir:
+        os.makedirs(target_dir, exist_ok=True)
+
+    last_error = None
+    for i in range(retries):
+        try:
+            with _file_lock:
+                with open(target_path, "a", encoding="utf-8") as out:
+                    out.write(line)
+                    out.flush()
+                    os.fsync(out.fileno())
+            return target_path
+        except Exception as e:
+            last_error = e
+            time.sleep(0.25 * (i + 1))
+
+    raise Exception(f"写入账号文件失败({target_path}): {last_error}")
 
 
 # Chrome 指纹配置: impersonate 与 sec-ch-ua 必须匹配真实浏览器
@@ -502,7 +548,7 @@ def create_temp_email():
     chars = string.ascii_lowercase + string.digits
     length = random.randint(8, 13)
     email_local = "".join(random.choice(chars) for _ in range(length))
-    email = f"{email_local}@duckmail.sbs"
+    email = f"{email_local}@{DUCKMAIL_DOMAIN}"
     password = _generate_password()
 
     api_base = DUCKMAIL_API_BASE.rstrip("/")
@@ -742,7 +788,7 @@ class ChatGPTRegister:
         chars = string.ascii_lowercase + string.digits
         length = random.randint(8, 13)
         email_local = "".join(random.choice(chars) for _ in range(length))
-        email = f"{email_local}@duckmail.sbs"
+        email = f"{email_local}@{DUCKMAIL_DOMAIN}"
         password = _generate_password()
 
         api_base = DUCKMAIL_API_BASE.rstrip("/")
@@ -1696,6 +1742,11 @@ class ChatGPTRegister:
 def _register_one(idx, total, proxy, output_file):
     """单个注册任务 (在线程中运行) - 使用 DuckMail 临时邮箱"""
     reg = None
+    email = None
+    email_pwd = None
+    chatgpt_password = None
+    oauth_ok = False
+    oauth_tokens = None
     try:
         reg = ChatGPTRegister(proxy=proxy, tag=f"{idx}")
 
@@ -1724,27 +1775,43 @@ def _register_one(idx, total, proxy, output_file):
         oauth_ok = True
         if ENABLE_OAUTH:
             reg._print("[OAuth] 开始获取 Codex Token...")
-            tokens = reg.perform_codex_oauth_login_http(email, chatgpt_password, mail_token=mail_token)
-            oauth_ok = bool(tokens and tokens.get("access_token"))
-            if oauth_ok:
-                _save_codex_tokens(email, tokens)
-                reg._print("[OAuth] Token 已保存")
-            else:
+            oauth_tokens = reg.perform_codex_oauth_login_http(email, chatgpt_password, mail_token=mail_token)
+            oauth_ok = bool(oauth_tokens and oauth_tokens.get("access_token"))
+            if not oauth_ok:
                 msg = "OAuth 获取失败"
                 if OAUTH_REQUIRED:
                     raise Exception(f"{msg}（oauth_required=true）")
                 reg._print(f"[OAuth] {msg}（按配置继续）")
 
-        # 4. 线程安全写入结果
-        with _file_lock:
-            with open(output_file, "a", encoding="utf-8") as out:
-                out.write(f"{email}----{chatgpt_password}----{email_pwd}----oauth={'ok' if oauth_ok else 'fail'}\n")
+        # 4. 先写账号文件（核心约束：OAuth 成功后必须写入）
+        line = f"{email}----{chatgpt_password}----{email_pwd}----oauth={'ok' if oauth_ok else 'fail'}\n"
+        saved_path = _append_account_record(output_file, line)
+
+        # 5. OAuth 令牌保存作为后置步骤，不影响账号落盘
+        if ENABLE_OAUTH and oauth_ok and oauth_tokens:
+            try:
+                _save_codex_tokens(email, oauth_tokens)
+                reg._print("[OAuth] Token 已保存")
+            except Exception as e:
+                reg._print(f"[OAuth] Token 保存异常（账号已写入）: {e}")
 
         with _print_lock:
-            print(f"\n[OK] [{tag}] {email} 注册成功!")
+            print(f"\n[OK] [{tag}] {email} 注册成功! 账号已写入: {saved_path}")
         return True, email, None
 
     except Exception as e:
+        # 兜底：若 OAuth 已成功，尽最大努力补写账号文件
+        if ENABLE_OAUTH and oauth_ok and email and chatgpt_password and email_pwd:
+            try:
+                line = f"{email}----{chatgpt_password}----{email_pwd}----oauth=ok\n"
+                saved_path = _append_account_record(output_file, line, retries=12)
+                with _print_lock:
+                    print(f"\n[WARN] [{idx}] 发生异常但 OAuth 已成功，已补写账号到: {saved_path}")
+                return True, email, None
+            except Exception as write_err:
+                with _print_lock:
+                    print(f"\n[FAIL] [{idx}] OAuth 成功但补写账号失败: {write_err}")
+
         error_msg = str(e)
         with _print_lock:
             print(f"\n[FAIL] [{idx}] 注册失败: {error_msg}")
@@ -1767,6 +1834,7 @@ def run_batch(total_accounts: int = 3, output_file="registered_accounts.txt",
     print(f"  ChatGPT 批量自动注册 (DuckMail 临时邮箱版)")
     print(f"  注册数量: {total_accounts} | 并发数: {actual_workers}")
     print(f"  DuckMail: {DUCKMAIL_API_BASE}")
+    print(f"  邮箱域名: {DUCKMAIL_DOMAIN}")
     print(f"  OAuth: {'开启' if ENABLE_OAUTH else '关闭'} | required: {'是' if OAUTH_REQUIRED else '否'}")
     if ENABLE_OAUTH:
         print(f"  OAuth Issuer: {OAUTH_ISSUER}")
